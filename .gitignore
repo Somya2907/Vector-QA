@@ -1,0 +1,28 @@
+# Environment variables
+.env
+
+# Handbook source data
+handbook-main-content-handbook/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
