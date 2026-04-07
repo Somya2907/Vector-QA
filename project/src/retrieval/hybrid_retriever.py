@@ -91,10 +91,14 @@ def _rrf_fuse(
         if key not in result_map:
             result_map[key] = r
 
+    # Normalise by the theoretical maximum (rank-1 in both lists) so scores
+    # are in [0, 1]: 1.0 = top of both retrievers, 0.5 = top of one only.
+    max_possible = 2.0 / (k + 1)
+
     fused: list[SearchResult] = []
     for key, score in sorted(rrf_scores.items(), key=lambda t: t[1], reverse=True):
         r = result_map[key]
-        r.score = score
+        r.score = score / max_possible
         fused.append(r)
 
     return fused

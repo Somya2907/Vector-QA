@@ -38,6 +38,13 @@ from typing import Any
 
 from src.retrieval.retriever import Retriever, RetrievalResult
 from src.generation.claude_client import ClaudeClient, ClaudeResponse
+from src.utils.cache import QueryCache
+from src.pipeline.confidence import (
+    compute_confidence,
+    confidence_label as _label,
+    LOW_CONF,
+    MED_CONF,
+)
 
 # ---------------------------------------------------------------------------
 # System prompt
@@ -85,6 +92,9 @@ class RAGResponse:
     ttft_seconds: float
     total_seconds: float
     user_role: str | None
+    confidence: float = 0.0                  # Combined retrieval confidence [0, 1]
+    confidence_label: str = "low"            # "low" | "medium" | "high"
+    cache_hit: bool = False                  # True when result was served from cache
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> str:
@@ -92,6 +102,7 @@ class RAGResponse:
         return (
             f"RAGResponse("
             f"chunks={self.chunks_used}, "
+            f"confidence={self.confidence:.2f} ({self.confidence_label}), "
             f"citations={len(self.citations)}, "
             f"tokens={self.input_tokens}→{self.output_tokens}, "
             f"ttft={self.ttft_seconds:.2f}s, "
@@ -209,6 +220,7 @@ class RAGPipeline:
         retriever: Retriever,
         claude_client: ClaudeClient,
         system_prompt: str = _SYSTEM_PROMPT,
+        cache: QueryCache | None = None,
     ) -> None:
         """
         Args:
@@ -217,10 +229,13 @@ class RAGPipeline:
             claude_client:  Configured Claude API client.
             system_prompt:  System instructions prepended to every request.
                             Override to customise tone, language, or domain.
+            cache:          Optional QueryCache.  When provided, run() and
+                            run_stream() skip retrieval + generation on hits.
         """
         self.retriever = retriever
         self.claude = claude_client
         self.system_prompt = system_prompt
+        self.cache = cache
 
     def run(
         self,
@@ -238,6 +253,13 @@ class RAGPipeline:
             RAGResponse with the answer, citations, and latency data.
             If no chunks are retrieved, the answer explains that.
         """
+        # ── 0. Cache check ────────────────────────────────────────────────────
+        if self.cache is not None:
+            cached = self.cache.get(query, user_role)
+            if cached is not None:
+                cached.cache_hit = True
+                return cached
+
         # ── 1. Retrieve ───────────────────────────────────────────────────────
         chunks: list[RetrievalResult] = self.retriever.retrieve(
             query, user_role=user_role
@@ -259,24 +281,56 @@ class RAGPipeline:
                 ttft_seconds=0.0,
                 total_seconds=0.0,
                 user_role=user_role,
+                confidence=0.0,
+                confidence_label="low",
             )
 
-        # ── 2. Build prompt ───────────────────────────────────────────────────
+        # ── 2. Confidence scoring ─────────────────────────────────────────────
+        scores = [r.score for r in chunks]
+        conf = compute_confidence(scores, debug=False)
+        conf_label = _label(conf)
+
+        if conf < LOW_CONF:
+            return RAGResponse(
+                query=query,
+                answer=(
+                    "I don't have enough high-confidence information to "
+                    "answer this reliably."
+                ),
+                citations=[],
+                chunks=chunks,
+                chunks_used=len(chunks),
+                model=self.claude.model,
+                input_tokens=0,
+                output_tokens=0,
+                ttft_seconds=0.0,
+                total_seconds=0.0,
+                user_role=user_role,
+                confidence=conf,
+                confidence_label=conf_label,
+            )
+
+        # ── 3. Build prompt ───────────────────────────────────────────────────
         context_block = build_context_block(chunks)
         messages = build_messages(query, context_block)
 
-        # ── 3. Generate ───────────────────────────────────────────────────────
+        # ── 4. Generate ───────────────────────────────────────────────────────
         response: ClaudeResponse = self.claude.complete(
             messages=messages,
             system=self.system_prompt,
         )
 
-        # ── 4. Extract citations ──────────────────────────────────────────────
-        citations = extract_citations(response.content, chunks)
+        # ── 5. Apply uncertainty prefix for medium confidence ─────────────────
+        answer = response.content
+        if conf < MED_CONF:
+            answer = "⚠️ This answer may be incomplete or uncertain.\n\n" + answer
 
-        return RAGResponse(
+        # ── 6. Extract citations ──────────────────────────────────────────────
+        citations = extract_citations(answer, chunks)
+
+        result = RAGResponse(
             query=query,
-            answer=response.content,
+            answer=answer,
             citations=citations,
             chunks=chunks,
             chunks_used=len(chunks),
@@ -286,7 +340,12 @@ class RAGPipeline:
             ttft_seconds=response.ttft_seconds,
             total_seconds=response.total_seconds,
             user_role=user_role,
+            confidence=conf,
+            confidence_label=conf_label,
         )
+        if self.cache is not None:
+            self.cache.set(query, user_role, result)
+        return result
 
     def run_stream(
         self,
@@ -307,6 +366,17 @@ class RAGPipeline:
         Returns:
             RAGResponse with the complete assembled answer.
         """
+        # ── 0. Cache check ────────────────────────────────────────────────────
+        if self.cache is not None:
+            cached = self.cache.get(query, user_role)
+            if cached is not None:
+                cached.cache_hit = True
+                # Replay the full answer as a single token so the streaming
+                # caller receives the text in the same code path.
+                if on_token:
+                    on_token(cached.answer)
+                return cached
+
         chunks = self.retriever.retrieve(query, user_role=user_role)
 
         if not chunks:
@@ -328,21 +398,60 @@ class RAGPipeline:
                 ttft_seconds=0.0,
                 total_seconds=0.0,
                 user_role=user_role,
+                confidence=0.0,
+                confidence_label="low",
+            )
+
+        # ── Confidence scoring ────────────────────────────────────────────────
+        scores = [r.score for r in chunks]
+        conf = compute_confidence(scores, debug=False)
+        conf_label = _label(conf)
+
+        if conf < LOW_CONF:
+            abstain_answer = (
+                "I don't have enough high-confidence information to "
+                "answer this reliably."
+            )
+            if on_token:
+                on_token(abstain_answer)
+            return RAGResponse(
+                query=query,
+                answer=abstain_answer,
+                citations=[],
+                chunks=chunks,
+                chunks_used=len(chunks),
+                model=self.claude.model,
+                input_tokens=0,
+                output_tokens=0,
+                ttft_seconds=0.0,
+                total_seconds=0.0,
+                user_role=user_role,
+                confidence=conf,
+                confidence_label=conf_label,
             )
 
         context_block = build_context_block(chunks)
         messages = build_messages(query, context_block)
+
+        # Stream uncertainty prefix for medium confidence before Claude tokens
+        if conf < MED_CONF and on_token:
+            on_token("⚠️ This answer may be incomplete or uncertain.\n\n")
 
         response = self.claude.stream(
             messages=messages,
             system=self.system_prompt,
             on_token=on_token,
         )
-        citations = extract_citations(response.content, chunks)
 
-        return RAGResponse(
+        answer = response.content
+        if conf < MED_CONF:
+            answer = "⚠️ This answer may be incomplete or uncertain.\n\n" + answer
+
+        citations = extract_citations(answer, chunks)
+
+        result = RAGResponse(
             query=query,
-            answer=response.content,
+            answer=answer,
             citations=citations,
             chunks=chunks,
             chunks_used=len(chunks),
@@ -352,4 +461,9 @@ class RAGPipeline:
             ttft_seconds=response.ttft_seconds,
             total_seconds=response.total_seconds,
             user_role=user_role,
+            confidence=conf,
+            confidence_label=conf_label,
         )
+        if self.cache is not None:
+            self.cache.set(query, user_role, result)
+        return result
