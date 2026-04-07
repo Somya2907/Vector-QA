@@ -100,20 +100,7 @@ Create a `.env` file in the `project/` directory:
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-### 3. Build the index
-
-Point `--source` at the root of your handbook `.md` files:
-
-```bash
-python scripts/build_index.py \
-    --source /path/to/handbook \
-    --index-dir ./data/index
-```
-
-Runs 5 steps: load → chunk → embed → build FAISS → build BM25.
-Output: `data/index/index.faiss`, `metadata.json`, `bm25.pkl` (~160 MB total, gitignored).
-
-### 4. Run the Streamlit UI
+### 3. Run the Streamlit UI
 
 ```bash
 streamlit run app/streamlit_app.py
@@ -121,7 +108,7 @@ streamlit run app/streamlit_app.py
 
 Open [http://localhost:8501](http://localhost:8501). The sidebar has model selector, top-k slider, and neural reranker toggle. Use the **Ask / About** toggle to switch pages.
 
-### 5. Or run a CLI query
+### 4. Or run a CLI query
 
 ```bash
 # Single query
