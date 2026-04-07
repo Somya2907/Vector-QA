@@ -149,7 +149,6 @@ python scripts/run_query.py --index-dir ./data/index
 | Streaming Claude with TTFT | `ClaudeClient` always uses streaming internally so time-to-first-token is accurately measured even for blocking calls. |
 | Role inference from file path | `finance/` → `["finance"]`, `engineering/` → `["engineering"]`, else → `["public"]`. Extend `_ROLE_RULES` in `metadata.py` to add more roles. |
 | Chunk-level permissions | Filtering happens per chunk, not per document — fine-grained control even within a single file. |
-| Index artifacts gitignored | 161 MB total — too large for git. Rebuild with `build_index.py` or distribute via external storage. |
 
 ---
 
