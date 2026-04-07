@@ -1,4 +1,3 @@
-from .access_control import AccessControl
-from .policy_engine import PolicyEngine
+from .access_control import AccessControl, can_access, filter_by_role
 
-__all__ = ["AccessControl", "PolicyEngine"]
+__all__ = ["AccessControl", "can_access", "filter_by_role"]

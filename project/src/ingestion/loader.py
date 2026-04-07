@@ -10,9 +10,19 @@ from __future__ import annotations
 
 import re
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from .document_loader import Document
+
+@dataclass
+class Document:
+    """A single loaded document with cleaned content and source metadata."""
+
+    doc_id: str
+    content: str
+    source: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 # File extensions this loader supports
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".md", ".txt"})

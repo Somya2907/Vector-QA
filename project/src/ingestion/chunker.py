@@ -28,7 +28,7 @@ from typing import Any
 
 import tiktoken
 
-from .document_loader import Document
+from .loader import Document
 
 # ---------------------------------------------------------------------------
 # Tokeniser (module-level singleton — loading it is expensive)
