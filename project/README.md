@@ -1,6 +1,6 @@
 # Permission-Aware Vector QA System
 
-A production-style Retrieval-Augmented Generation (RAG) system where every retrieved chunk is filtered through a fine-grained access-control layer before being passed to the LLM.
+A production-style Retrieval-Augmented Generation (RAG) system built on the GitLab handbook. Every retrieved chunk is filtered through a role-based access-control layer before being passed to Claude. Retrieval combines dense (FAISS) and sparse (BM25) signals via Reciprocal Rank Fusion, with an optional neural cross-encoder reranker.
 
 ---
 
@@ -9,33 +9,21 @@ A production-style Retrieval-Augmented Generation (RAG) system where every retri
 ```
 User Query
     │
-    ▼
-┌─────────────┐     embed query     ┌─────────────┐
-│  QAPipeline │ ──────────────────► │   Embedder  │
-└─────────────┘                     └─────────────┘
-    │                                      │ query vector
-    │                                      ▼
-    │                             ┌──────────────────┐
-    │                             │   VectorStore    │  ◄── upsert (ingestion)
-    │                             │  (similarity     │
-    │                             │   search)        │
-    │                             └──────────────────┘
-    │                                      │ top-N candidates
-    │                                      ▼
-    │                             ┌──────────────────┐
-    │                             │  AccessControl   │
-    │                             │  (PolicyEngine)  │
-    │                             └──────────────────┘
-    │                                      │ permitted chunks only
-    │                                      ▼
-    │                             ┌──────────────────┐
-    └──────────────────────────── │ AnswerGenerator  │
-                                  │  (LLMClient)     │
-                                  └──────────────────┘
-                                          │
-                                          ▼
-                                     QAResponse
-                                  (answer + citations)
+    ├─► Embedder ──────────────────► FaissVectorStore (dense)
+    │                                       │
+    └─► BM25Store (sparse) ─────────────────┤
+                                            │
+                                    RRF Fusion (k=60)
+                                            │
+                                    AccessControl (role filter)
+                                            │
+                                    Reranker (optional, cross-encoder)
+                                            │
+                                    RAGPipeline
+                                            │
+                                    Claude API (streaming)
+                                            │
+                                    Answer + Citations + Latency
 ```
 
 ---
@@ -44,36 +32,36 @@ User Query
 
 ```
 project/
-├── data/                   # Raw and processed documents (gitignored)
+├── data/
+│   └── index/                  # Built artifacts (gitignored — see Build Index)
+│       ├── index.faiss         # FAISS dense index
+│       ├── metadata.json       # Chunk records
+│       └── bm25.pkl            # BM25 sparse index
 ├── src/
 │   ├── ingestion/
-│   │   ├── document_loader.py   # Load docs from filesystem / S3
-│   │   ├── chunker.py           # Split docs into overlapping chunks
-│   │   └── embedder.py          # Generate dense embeddings
+│   │   ├── loader.py           # Load .md/.txt, strip YAML front matter
+│   │   ├── chunker.py          # Tiktoken-based chunking (target/max/overlap)
+│   │   └── metadata.py         # Role inference, section extraction
 │   ├── retrieval/
-│   │   ├── vector_store.py      # Vector DB abstraction (upsert / search)
-│   │   └── retriever.py         # Permission-filtered retrieval
+│   │   ├── embedder.py         # sentence-transformers (all-MiniLM-L6-v2)
+│   │   ├── vector_store.py     # FAISS IndexFlatIP (cosine similarity)
+│   │   ├── bm25_store.py       # BM25Okapi sparse index (rank_bm25)
+│   │   ├── retriever.py        # Dense-only retriever
+│   │   ├── hybrid_retriever.py # RRF fusion of dense + sparse (default)
+│   │   └── reranker.py         # Cross-encoder reranker (BAAI/bge-reranker-base)
 │   ├── permissions/
-│   │   ├── access_control.py    # Per-chunk access decisions
-│   │   └── policy_engine.py     # Policy definition & evaluation
+│   │   └── access_control.py   # can_access(), filter_by_role(), AccessControl
 │   ├── generation/
-│   │   ├── llm_client.py        # LLM API wrapper (Claude)
-│   │   └── answer_generator.py  # Prompt construction & answer generation
-│   ├── pipeline/
-│   │   └── qa_pipeline.py       # End-to-end orchestrator
-│   ├── evaluation/
-│   │   └── evaluator.py         # Retrieval & answer quality metrics
-│   └── utils/
-│       ├── config.py            # Typed settings via pydantic-settings
-│       └── logger.py            # Structured JSON logging via structlog
+│   │   └── claude_client.py    # Claude API wrapper (streaming, TTFT measurement)
+│   └── pipeline/
+│       └── rag_pipeline.py     # End-to-end orchestrator, citation extraction
 ├── app/
-│   ├── main.py                  # FastAPI app factory + health endpoint
-│   └── routes.py                # REST API endpoints (/ask, /ingest, ...)
+│   └── streamlit_app.py        # Streamlit UI (streaming answer, citations, metrics)
 ├── scripts/
-│   ├── ingest.py                # CLI: ingest documents into vector store
-│   └── evaluate.py              # CLI: run evaluation suite
+│   ├── build_index.py          # Build FAISS + BM25 index from handbook files
+│   └── run_query.py            # CLI query runner / interactive REPL
 ├── requirements.txt
-└── README.md
+└── pyproject.toml
 ```
 
 ---
@@ -83,36 +71,53 @@ project/
 ### 1. Install dependencies
 
 ```bash
+cd project
 python -m venv .venv
 source .venv/bin/activate
+pip install -e .
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment
+### 2. Set your API key
+
+Create a `.env` file in the `project/` directory:
 
 ```bash
-cp .env.example .env
-# Edit .env and set ANTHROPIC_API_KEY, vector store credentials, etc.
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-### 3. Ingest documents
+### 3. Build the index
+
+Point `--source` at the root of your handbook `.md` files:
 
 ```bash
-python scripts/ingest.py --source ./data/raw --recursive \
-  --permission-tags department=engineering access_level=internal
+python scripts/build_index.py \
+    --source /path/to/handbook \
+    --index-dir ./data/index
 ```
 
-### 4. Start the API server
+This runs 5 steps: load → chunk → embed → build FAISS → build BM25.
+Output: `data/index/index.faiss`, `metadata.json`, `bm25.pkl` (~160 MB total, gitignored).
+
+### 4. Run the Streamlit UI
 
 ```bash
-uvicorn app.main:app --reload
-# API docs available at http://localhost:8000/docs
+streamlit run app/streamlit_app.py
 ```
 
-### 5. Run the evaluation suite
+Open [http://localhost:8501](http://localhost:8501). The sidebar lets you choose model, top-k, and toggle the neural reranker.
+
+### 5. Or run a CLI query
 
 ```bash
-python scripts/evaluate.py --dataset ./data/eval_set.jsonl --top-k 5
+# Single query
+python scripts/run_query.py --index-dir ./data/index --query "how do I request time off?"
+
+# With role filtering
+python scripts/run_query.py --index-dir ./data/index --role engineering --query "code review process"
+
+# Interactive REPL
+python scripts/run_query.py --index-dir ./data/index
 ```
 
 ---
@@ -121,11 +126,37 @@ python scripts/evaluate.py --dataset ./data/eval_set.jsonl --top-k 5
 
 | Decision | Rationale |
 |---|---|
-| Permission tags stored on chunks | Enables chunk-level access control, not just document-level |
-| Default-deny policy model | All policies must permit; a single deny blocks access |
-| Permission filtering before generation | LLM never sees unauthorised content |
-| Structured logging (structlog) | Machine-parseable JSON logs for observability pipelines |
-| Pydantic Settings | Type-safe config with environment variable overrides |
+| Hybrid retrieval (BM25 + FAISS) | Dense retrieval misses exact keywords; BM25 misses paraphrasing. RRF covers both blind spots. |
+| RRF with k=60 | Standard constant that dampens top-rank dominance without losing signal from either retriever. |
+| Permission filtering after fusion | Fuse first over maximum candidates, then gate — avoids role-leaking into ranking. |
+| Cross-encoder reranker (optional) | BAAI/bge-reranker-base scores query–chunk pairs jointly; more accurate than bi-encoder but slower. |
+| Streaming Claude with TTFT | `ClaudeClient` always uses streaming internally so time-to-first-token is measured accurately. |
+| Role inference from file path | `finance/` → `["finance"]`, `engineering/` → `["engineering"]`, else → `["public"]`. Extend `_ROLE_RULES` in `metadata.py` to add more roles. |
+| Chunk-level (not doc-level) permissions | A single document can have sections with different roles if split across paths. |
+| Index artifacts gitignored | 161 MB total — too large for git. Rebuild with `build_index.py` or share via external storage. |
+
+---
+
+## Retrieval Pipeline Detail
+
+```
+build_index.py
+  1. load_directory()        → Document[]         (strips YAML front matter)
+  2. Chunker.chunk_document() → Chunk[]            (600 target / 800 max / 100 overlap tokens)
+  3. attach_metadata()       → {text, metadata}[] (roles, section, chunk_id, doc_id)
+  4. Embedder.embed_texts()  → float32[N, 384]    (all-MiniLM-L6-v2)
+  5. FaissVectorStore.save() → index.faiss + metadata.json
+  6. BM25Store.save()        → bm25.pkl
+
+retrieve(query, user_role)
+  1. embed_query()           → float32[384]
+  2. faiss_store.search()    → top 3k dense candidates
+  3. bm25_store.search()     → top 3k sparse candidates
+  4. _rrf_fuse()             → unified ranked list  (score = Σ 1/(60+rank))
+  5. filter_search_results() → role-permitted subset
+  6. reranker.rerank()       → cross-encoder scores [0,1]  (if enabled)
+  7. return top-k
+```
 
 ---
 
@@ -134,13 +165,8 @@ python scripts/evaluate.py --dataset ./data/eval_set.jsonl --top-k 5
 | Variable | Default | Description |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | Claude API key (required) |
-| `LLM_MODEL` | `claude-sonnet-4-6` | Model ID for answer generation |
-| `EMBEDDING_MODEL` | `voyage-3` | Embedding model identifier |
-| `VECTOR_STORE_BACKEND` | `chromadb` | Vector DB backend |
-| `RETRIEVAL_TOP_K` | `10` | Candidates fetched before permission filtering |
-| `CHUNK_SIZE` | `512` | Target chunk size in tokens |
-| `CHUNK_OVERLAP` | `64` | Overlap between consecutive chunks |
-| `LOG_LEVEL` | `INFO` | Logging verbosity |
+
+All other parameters (model, top-k, index directory, reranker on/off) are configurable at runtime via the Streamlit sidebar or CLI flags.
 
 ---
 
